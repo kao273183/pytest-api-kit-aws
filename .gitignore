@@ -1,0 +1,11 @@
+.DS_Store
+.env
+.env.local
+.idea/
+.vscode/
+
+# Users shouldn't commit these to THEIR repo — include here so tests of
+# the template don't leak
+reports/
+data/api_snapshots/*.json
+*.log

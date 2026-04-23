@@ -1,0 +1,68 @@
+name: Daily API smoke (ECS Fargate)
+
+# Runs once a day on a low-traffic cron slot, plus manual trigger.
+# Drops the local pytest runner in favour of the already-deployed ECS image —
+# so CI just kicks off the Fargate task and tails the log.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment (uat / staging / prod)'
+        type: string
+        default: uat
+      pytest_args:
+        description: 'Extra pytest args (e.g. `-m "smoke and not slow"`)'
+        type: string
+        default: ''
+  schedule:
+    # UTC 22:47 = Taipei 06:47 — deliberately NOT on :00 / :15 / :30 / :45
+    # because GitHub Actions drops scheduled workflows during high-load minutes.
+    - cron: '47 22 * * *'
+
+permissions:
+  id-token: write    # OIDC → AWS
+  contents: read
+
+env:
+  AWS_REGION: ap-northeast-1
+  ECS_CLUSTER: hello-cluster
+  TASK_FAMILY: pytest-api-kit
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Launch ECS task
+        id: run
+        run: |
+          ENV="${{ inputs.environment || 'uat' }}"
+          PYTEST_ARGS='${{ inputs.pytest_args || '' }}'
+
+          TASK_ARN=$(aws ecs run-task \
+            --cluster "$ECS_CLUSTER" \
+            --task-definition "$TASK_FAMILY" \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[${{ secrets.FARGATE_SUBNET }}],securityGroups=[${{ secrets.FARGATE_SG }}],assignPublicIp=DISABLED}" \
+            --overrides "{\"containerOverrides\":[{\"name\":\"pytest-runner\",\"environment\":[{\"name\":\"ENVIRONMENT\",\"value\":\"$ENV\"},{\"name\":\"PYTEST_ARGS\",\"value\":\"$PYTEST_ARGS\"}]}]}" \
+            --query "tasks[0].taskArn" --output text)
+
+          echo "task_arn=$TASK_ARN" >> $GITHUB_OUTPUT
+          echo "Task launched: $TASK_ARN"
+
+      - name: Wait for task completion
+        run: |
+          TASK_ARN="${{ steps.run.outputs.task_arn }}"
+          aws ecs wait tasks-stopped --cluster "$ECS_CLUSTER" --tasks "$TASK_ARN"
+
+          EXIT_CODE=$(aws ecs describe-tasks --cluster "$ECS_CLUSTER" --tasks "$TASK_ARN" \
+            --query "tasks[0].containers[0].exitCode" --output text)
+
+          echo "Task finished with exit code: $EXIT_CODE"
+          exit "$EXIT_CODE"
